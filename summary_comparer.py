@@ -1,94 +1,112 @@
 import sys
 import re
 from collections import defaultdict
-from datetime import datetime
 
-def parse_summary_file(file_path):
-    """Парсинг summary-файла и извлечение данных"""
-    data = defaultdict(dict)
-    pattern = re.compile(r'^(.*?) \| (.*?) \| выполнился (\d+) раз$')
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            match = pattern.match(line.strip())
-            if match:
-                timestamp = match.group(1).strip()
-                query = match.group(2).strip()
-                count = int(match.group(3))
-                
-                # Нормализация временной метки для корректной сортировки
-                if ':' in timestamp:  # Минутные/часовые данные
-                    try:
-                        dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M')
-                        normalized_timestamp = dt.strftime('%Y-%m-%d %H:%M')
-                    except ValueError:
-                        normalized_timestamp = timestamp
-                else:  # Дневные данные
-                    normalized_timestamp = timestamp
-                
-                data[normalized_timestamp][query] = count
-    
-    return data
+def determine_file_type(timestamp_str):
+    """Определяет тип файла по формату временной метки"""
+    if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", timestamp_str):
+        return "minute"
+    elif re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", timestamp_str):
+        return "hour"
+    elif re.match(r"\d{4}-\d{2}-\d{2}", timestamp_str):
+        return "day"
+    return "unknown"
 
-def compare_summary_files(file_paths):
-    """Сравнение данных из нескольких summary-файлов"""
-    # Сбор данных из всех файлов
-    all_data = []
-    for path in file_paths:
-        all_data.append(parse_summary_file(path))
+def extract_time_key(timestamp_str, file_type):
+    """Извлекает ключ времени в зависимости от типа файла"""
+    if file_type == "minute":
+        return timestamp_str[11:16]  # HH:MM
+    elif file_type == "hour":
+        return timestamp_str[11:13] + ":00"  # HH:00
+    elif file_type == "day":
+        return "daily"
+    return ""
+
+def process_files(file_paths):
+    """Обрабатывает файлы и возвращает объединенные данные"""
+    # Словарь для хранения результатов: (query, time_key) -> {file_index: (timestamp, count)}
+    combined_data = defaultdict(lambda: [("", 0)] * len(file_paths))
+    file_types = []
     
-    # Сбор всех уникальных временных меток и запросов
-    all_timestamps = set()
-    all_queries = set()
+    # Определяем типы файлов
+    for file_path in file_paths:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            if not first_line:
+                file_types.append("unknown")
+                continue
+                
+            parts = first_line.split(' | ', 2)
+            if len(parts) < 3:
+                file_types.append("unknown")
+            else:
+                file_types.append(determine_file_type(parts[0]))
     
-    for data in all_data:
-        for timestamp, queries in data.items():
-            all_timestamps.add(timestamp)
-            all_queries.update(queries.keys())
-    
-    # Сортировка временных меток
-    sorted_timestamps = sorted(all_timestamps, key=lambda ts: (
-        datetime.strptime(ts, '%Y-%m-%d %H:%M') if ':' in ts 
-        else datetime.strptime(ts, '%Y-%m-%d')
-    ))
-    
-    # Создание матрицы сравнения
-    comparison_matrix = []
-    
-    for timestamp in sorted_timestamps:
-        for query in sorted(all_queries):
+    # Обрабатываем каждый файл
+    for file_index, file_path in enumerate(file_paths):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                parts = line.split(' | ', 2)
+                if len(parts) < 3:
+                    continue
+                    
+                timestamp_str = parts[0]
+                sql = parts[1]
+                
+                # Извлекаем количество выполнений
+                count_part = parts[2]
+                try:
+                    count = int(count_part.split()[-2])  # Предпоследнее слово в последней части
+                except (ValueError, IndexError):
+                    continue
+                
+                # Получаем тип файла и ключ времени
+                file_type = file_types[file_index]
+                time_key = extract_time_key(timestamp_str, file_type)
+                
+                # Обновляем данные
+                key = (sql, time_key)
+                current_data = list(combined_data[key])
+                current_data[file_index] = (timestamp_str, count)
+                combined_data[key] = current_data
+                
+    return combined_data, file_paths
+
+def save_combined_results(data, file_paths, output_file="combined_results.log"):
+    """Сохраняет объединенные результаты в файл"""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        # Заголовок с именами файлов
+        header = " | ".join([f"TimeStamp_{i+1}" for i in range(len(file_paths))])
+        header += " | SQL_Query | " + " | ".join([f"Count_{i+1}" for i in range(len(file_paths))])
+        f.write(header + "\n")
+        
+        # Данные
+        for (sql, time_key), file_data in data.items():
+            timestamps = []
             counts = []
-            for data in all_data:
-                # Получение количества выполнений для данного timestamp и query
-                count = data.get(timestamp, {}).get(query, 0)
+            
+            for timestamp, count in file_data:
+                timestamps.append(timestamp)
                 counts.append(str(count))
             
-            # Добавляем только строки с ненулевыми значениями
-            if any(c != '0' for c in counts):
-                comparison_matrix.append(
-                    f"{timestamp} | {query} | {' | '.join(counts)}"
-                )
-    
-    return comparison_matrix
+            timestamp_line = " | ".join(timestamps)
+            count_line = " | ".join(counts)
+            f.write(f"{timestamp_line} | {sql} | {count_line}\n")
 
 def main():
-    # Проверка аргументов командной строки
     if len(sys.argv) < 2 or len(sys.argv) > 8:
-        print("Использование: python summary_comparer.py file1 [file2 ... file7]")
+        print("Использование: python combiner.py file1 [file2 ... file7]")
         print("Максимальное количество файлов: 7")
-        sys.exit(1)
-    
+        return
+
     file_paths = sys.argv[1:]
-    
-    # Сравнение данных
-    results = compare_summary_files(file_paths)
-    
-    # Вывод результатов
-    for line in results:
-        print(line)
-    
-    print(f"\nОбработано файлов: {len(file_paths)}")
-    print(f"Всего строк сравнения: {len(results)}")
+    combined_data, processed_files = process_files(file_paths)
+    save_combined_results(combined_data, processed_files)
+    print(f"Результаты объединены в файл: combined_results.log")
 
 if __name__ == "__main__":
     main()
